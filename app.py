@@ -17,62 +17,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# =========================
+# REQUEST
+# =========================
 class CodeRequest(BaseModel):
     code: str
     language: str
+    input: str = ""   # 🔥 NEW
 
 
 # =========================
-# 🔥 SAFE CHECK (basic)
+# EXTENSIONS
 # =========================
-def is_safe(code: str):
-    blocked = ["import os", "import sys", "subprocess", "open(", "__"]
-    return not any(b in code for b in blocked)
+EXT_MAP = {
+    "python": ".py",
+    "javascript": ".js",
+    "cpp": ".cpp",
+    "c": ".c",
+    "java": ".java",
+    "rust": ".rs",
+    "go": ".go",
+    "bash": ".sh"
+}
 
 
 # =========================
-# 🔥 COMMAND BUILDER
+# COMMAND BUILDER
 # =========================
-def get_command(filename, language):
+def get_run_command(filename, language):
+
     if language == "python":
-        return ["python", filename]
+        return f"python {filename}"
 
     elif language == "javascript":
-        return ["node", filename]
+        return f"node {filename}"
 
     elif language == "cpp":
-        return ["bash", "-c", f"g++ {filename} -o out && ./out"]
+        return f"g++ {filename} -o out && ./out"
+
+    elif language == "c":
+        return f"gcc {filename} -o out && ./out"
+
+    elif language == "java":
+        classname = filename.replace(".java", "")
+        return f"javac {filename} && java {classname}"
 
     elif language == "rust":
-        return ["bash", "-c", f"rustc {filename} -o out && ./out"]
+        return f"rustc {filename} -o out && ./out"
 
-    else:
-        return None
+    elif language == "go":
+        return f"go run {filename}"
+
+    elif language == "bash":
+        return f"bash {filename}"
+
+    return None
 
 
 # =========================
-# 🔥 STREAM EXECUTION
+# STREAM EXECUTION
 # =========================
 @app.post("/run/stream")
 def run_code_stream(req: CodeRequest):
 
     def generate():
 
-        if not is_safe(req.code):
-            yield f"data: {json.dumps({'error': 'Unsafe code detected'})}\n\n"
-            return
-
         file_id = str(uuid.uuid4())
-
-        ext_map = {
-            "python": ".py",
-            "javascript": ".js",
-            "cpp": ".cpp",
-            "rust": ".rs"
-        }
-
-        ext = ext_map.get(req.language)
+        ext = EXT_MAP.get(req.language)
 
         if not ext:
             yield f"data: {json.dumps({'error': 'Unsupported language'})}\n\n"
@@ -83,28 +94,57 @@ def run_code_stream(req: CodeRequest):
         with open(filename, "w") as f:
             f.write(req.code)
 
-        cmd = get_command(filename, req.language)
+        run_cmd = get_run_command(filename, req.language)
+
+        if not run_cmd:
+            yield f"data: {json.dumps({'error': 'Invalid command'})}\n\n"
+            return
+
+        # 🔥 DOCKER COMMAND
+        docker_cmd = [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "-i",   # 🔥 allow stdin
+            "-v", f"{os.getcwd()}:/app",
+            "-w", "/app",
+            "ubuntu:22.04",
+            "bash", "-c",
+            f"""
+            apt update >/dev/null 2>&1 &&
+            apt install -y python3 nodejs gcc g++ openjdk-17-jdk golang rustc >/dev/null 2>&1 &&
+            {run_cmd}
+            """
+        ]
 
         try:
             process = subprocess.Popen(
-                cmd,
+                docker_cmd,
+                stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1
             )
 
-            # 🔥 STREAM STDOUT
-            for line in process.stdout:
-                yield f"data: {json.dumps({'type': 'stdout', 'content': line})}\n\n"
+            # 🔥 SEND INPUT
+            if req.input:
+                process.stdin.write(req.input)
+                process.stdin.close()
 
-            # 🔥 STREAM STDERR
-            for line in process.stderr:
-                yield f"data: {json.dumps({'type': 'stderr', 'content': line})}\n\n"
+            # 🔥 STREAM OUTPUT
+            while True:
+                output = process.stdout.readline()
+                if output:
+                    yield f"data: {json.dumps({'type':'stdout','content':output})}\n\n"
 
-            process.wait()
+                error = process.stderr.readline()
+                if error:
+                    yield f"data: {json.dumps({'type':'stderr','content':error})}\n\n"
 
-            yield f"event: done\ndata: {json.dumps({'status': 'finished'})}\n\n"
+                if output == "" and error == "" and process.poll() is not None:
+                    break
+
+            yield f"event: done\ndata: {json.dumps({'status':'finished'})}\n\n"
 
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -120,17 +160,6 @@ def run_code_stream(req: CodeRequest):
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-# =========================
-# HEALTH CHECK
-# =========================
 @app.get("/")
 def root():
-    return {"status": "Code Runner Streaming API 🚀"}
-
-
-# =========================
-# RUN
-# =========================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=10000)
+    return {"status": "Docker Code Runner 🚀"}
