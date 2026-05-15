@@ -4,6 +4,8 @@ numpy
 pandas
 sympy
 scipy
+seaborn
+scikit-learn
 matplotlib
 plotly
 requests
